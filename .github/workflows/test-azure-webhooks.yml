@@ -34,8 +34,8 @@ jobs:
       - name: Esperar prueba
         shell: bash
         run: |
-          echo "Esperando 120 segundos para que Automation termine..."
-          sleep 120
+          echo "Esperando 180 segundos para que Automation termine..."
+          sleep 180
 
       - name: Solicitar STOP a Azure Automation
         if: always()
