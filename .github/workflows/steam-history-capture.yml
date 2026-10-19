@@ -2,9 +2,7 @@ name: Steam historical capture
 
 on:
   workflow_dispatch:
-  schedule:
-    # Cada hora, al minuto 17 UTC. Evita el pico exacto de :00.
-    - cron: "17 * * * *"
+
 
 permissions:
   contents: read
