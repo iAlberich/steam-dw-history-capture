@@ -1,0 +1,51 @@
+name: Test Azure Webhooks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-webhooks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Obtener IP publica del runner
+        id: runner_ip
+        shell: bash
+        run: |
+          RUNNER_IP="$(curl -fsS https://api.ipify.org)"
+          echo "Runner IP obtenida."
+          echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Solicitar START a Azure Automation
+        shell: bash
+        env:
+          START_WEBHOOK: ${{ secrets.AZURE_START_WEBHOOK_URL }}
+          RUNNER_IP: ${{ steps.runner_ip.outputs.runner_ip }}
+        run: |
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"runner_ip\":\"$RUNNER_IP\"}" \
+            "$START_WEBHOOK"
+
+          echo
+          echo "Webhook START enviado."
+
+      - name: Esperar prueba
+        shell: bash
+        run: |
+          echo "Esperando 120 segundos para que Automation termine..."
+          sleep 120
+
+      - name: Solicitar STOP a Azure Automation
+        if: always()
+        shell: bash
+        env:
+          STOP_WEBHOOK: ${{ secrets.AZURE_STOP_WEBHOOK_URL }}
+        run: |
+          curl --fail --silent --show-error \
+            -X POST \
+            "$STOP_WEBHOOK"
+
+          echo
+          echo "Webhook STOP enviado."
