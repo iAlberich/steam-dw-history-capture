@@ -3,12 +3,11 @@ name: Steam historical capture
 on:
   workflow_dispatch:
   schedule:
-    # Cada hora, al minuto 17 (UTC). Evita el pico exacto de :00.
+    # Cada hora, al minuto 17 UTC. Evita el pico exacto de :00.
     - cron: "17 * * * *"
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: steam-historical-capture
@@ -18,7 +17,7 @@ jobs:
   capture-and-upload:
     name: Capture Steam and upload to Azure
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     env:
       CAPTURE_LIMIT: "0"
@@ -38,9 +37,9 @@ jobs:
 
       AZURE_PGPORT: "5432"
       AZURE_PGSSLMODE: "require"
+      AZURE_DB_CONNECT_ATTEMPTS: "30"
+      AZURE_DB_CONNECT_WAIT_SECONDS: "10"
 
-      AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-      AZURE_POSTGRES_SERVER: ${{ secrets.AZURE_POSTGRES_SERVER }}
       AZURE_PGHOST: ${{ secrets.AZURE_PGHOST }}
       AZURE_PGDATABASE: ${{ secrets.AZURE_PGDATABASE }}
       AZURE_PGUSER: ${{ secrets.AZURE_PGUSER }}
@@ -60,7 +59,7 @@ jobs:
         run: pip install -r requirements-history.txt
 
       # ----------------------------------------------------------
-      # Azure sigue apagado durante toda la captura Steam.
+      # Azure PostgreSQL permanece APAGADO durante captura + repair.
       # ----------------------------------------------------------
       - name: Capture Steam to staged SQLite
         run: python 44_steam_historical_capture_v4_staged.py
@@ -72,80 +71,86 @@ jobs:
           STAGED_FILE="$(ls -1t captures/*.sqlite | head -n 1)"
           test -n "$STAGED_FILE"
           echo "STAGED_FILE=$STAGED_FILE" >> "$GITHUB_ENV"
-          echo "Staged capture: $STAGED_FILE"
+          echo "Staged capture located."
 
       - name: Repair missing Store prices
         run: python 47_repair_staged_store_failures.py "$STAGED_FILE"
 
-      # ----------------------------------------------------------
-      # Solo desde aqui se usa Azure.
-      # OIDC: no hay client secret de Azure.
-      # ----------------------------------------------------------
-      - name: Login to Azure with OIDC
-        uses: azure/login@v3
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      # No se enciende Azure si el lote staged sigue incompleto.
+      - name: Verify staged batch is complete
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import sqlite3
 
-      - name: Start Azure PostgreSQL if stopped
+          path = os.environ["STAGED_FILE"]
+          db = sqlite3.connect(path)
+          try:
+              row = db.execute(
+                  """
+                  SELECT expected_games, captured_games, error_games, status
+                  FROM capture_batch
+                  LIMIT 1
+                  """
+              ).fetchone()
+          finally:
+              db.close()
+
+          if row is None:
+              raise SystemExit("capture_batch no existe en el staged SQLite.")
+
+          expected, captured, errors, status = row
+          print(
+              f"Staged batch: expected={expected}, captured={captured}, "
+              f"errors={errors}, status={status}"
+          )
+
+          if status != "SUCCESS" or int(errors) != 0 or int(captured) != int(expected):
+              raise SystemExit(
+                  "El lote staged no esta completo. Azure permanecera apagado."
+              )
+          PY
+
+      # ----------------------------------------------------------
+      # Desde aqui se necesita Azure.
+      # GitHub NO usa OIDC ni Azure CLI: llama al webhook privado
+      # de Azure Automation y le pasa solo la IP de este runner.
+      # ----------------------------------------------------------
+      - name: Get GitHub runner public IP
+        id: runner_ip
         shell: bash
         run: |
           set -euo pipefail
-
-          STATE="$(az postgres flexible-server show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$AZURE_POSTGRES_SERVER" \
-            --query state -o tsv)"
-
-          echo "Initial Azure PostgreSQL state: $STATE"
-
-          if [ "$STATE" = "Stopped" ]; then
-            az postgres flexible-server start \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$AZURE_POSTGRES_SERVER" \
-              --output none
-          fi
-
-          for i in $(seq 1 60); do
-            STATE="$(az postgres flexible-server show \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$AZURE_POSTGRES_SERVER" \
-              --query state -o tsv)"
-            echo "State [$i/60]: $STATE"
-
-            if [ "$STATE" = "Ready" ]; then
-              exit 0
-            fi
-
-            sleep 10
-          done
-
-          echo "Azure PostgreSQL did not reach Ready state." >&2
-          exit 1
-
-      - name: Allow only this GitHub runner IP
-        shell: bash
-        run: |
-          set -euo pipefail
-
           RUNNER_IP="$(curl --fail --silent --show-error https://api.ipify.org)"
           test -n "$RUNNER_IP"
+          echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+          echo "Runner public IP obtained."
 
-          FIREWALL_RULE="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Request Azure PostgreSQL START
+        shell: bash
+        env:
+          START_WEBHOOK: ${{ secrets.AZURE_START_WEBHOOK_URL }}
+          RUNNER_IP: ${{ steps.runner_ip.outputs.runner_ip }}
+        run: |
+          set -euo pipefail
+          test -n "$START_WEBHOOK"
+          test -n "$RUNNER_IP"
 
-          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "FIREWALL_RULE=$FIREWALL_RULE" >> "$GITHUB_ENV"
+          PAYLOAD="$(printf '{\"runner_ip\":\"%s\"}' "$RUNNER_IP")"
 
-          az postgres flexible-server firewall-rule create \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --server-name "$AZURE_POSTGRES_SERVER" \
-            --name "$FIREWALL_RULE" \
-            --start-ip-address "$RUNNER_IP" \
-            --end-ip-address "$RUNNER_IP" \
-            --output none
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$START_WEBHOOK" \
+            -o /tmp/azure-start-response.json
 
-      - name: Wait for PostgreSQL firewall propagation
+          echo "Azure Automation START webhook accepted."
+
+      # Este script espera la senal REAL: PostgreSQL responde y la
+      # regla temporal de firewall ya permite a este runner conectarse.
+      - name: Wait for Azure PostgreSQL access
         run: python 48_wait_for_azure_postgres.py
 
       - name: Upload staged batch to Azure
@@ -154,7 +159,8 @@ jobs:
       - name: Validate uploaded batch
         run: python 49_validate_uploaded_batch.py "$STAGED_FILE"
 
-      # Conserva el SQLite solo cuando algo falla para poder recuperarlo.
+      # Conserva SQLite solo cuando algo falla para poder diagnosticar
+      # o recuperar el lote sin repetir la captura completa.
       - name: Preserve staged capture on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -165,59 +171,31 @@ jobs:
           retention-days: 2
 
   cleanup:
-    name: Always close Azure access
+    name: Always request Azure shutdown
     needs: capture-and-upload
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     permissions:
       contents: read
-      id-token: write
-
-    env:
-      AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-      AZURE_POSTGRES_SERVER: ${{ secrets.AZURE_POSTGRES_SERVER }}
 
     steps:
-      - name: Login to Azure with OIDC
-        uses: azure/login@v3
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Remove temporary firewall rule
+      # Idempotente: si START nunca ocurrio, el runbook ve Stopped y termina.
+      # Si START ocurrio, elimina gha-runner-temp y solicita STOP.
+      - name: Request firewall cleanup and PostgreSQL STOP
         shell: bash
-        run: |
-          set +e
-          FIREWALL_RULE="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-          az postgres flexible-server firewall-rule delete \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --server-name "$AZURE_POSTGRES_SERVER" \
-            --name "$FIREWALL_RULE" \
-            --yes \
-            --output none
-          exit 0
-
-      - name: Stop Azure PostgreSQL
-        shell: bash
+        env:
+          STOP_WEBHOOK: ${{ secrets.AZURE_STOP_WEBHOOK_URL }}
         run: |
           set -euo pipefail
+          test -n "$STOP_WEBHOOK"
 
-          STATE="$(az postgres flexible-server show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$AZURE_POSTGRES_SERVER" \
-            --query state -o tsv)"
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            "$STOP_WEBHOOK" \
+            -o /tmp/azure-stop-response.json
 
-          echo "State before cleanup stop: $STATE"
-
-          if [ "$STATE" = "Ready" ]; then
-            az postgres flexible-server stop \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$AZURE_POSTGRES_SERVER" \
-              --output none
-          else
-            echo "No stop required for state: $STATE"
-          fi
+          echo "Azure Automation STOP webhook accepted."
