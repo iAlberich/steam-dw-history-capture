@@ -44,8 +44,10 @@ jobs:
           STOP_WEBHOOK: ${{ secrets.AZURE_STOP_WEBHOOK_URL }}
         run: |
           curl --fail --silent --show-error \
-            -X POST \
-            "$STOP_WEBHOOK"
+          -X POST \
+          -H "Content-Type: application/json" \
+          -d '{}' \
+          "$STOP_WEBHOOK"
 
           echo
           echo "Webhook STOP enviado."
