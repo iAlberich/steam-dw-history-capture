@@ -3,7 +3,6 @@ name: Steam historical capture
 on:
   workflow_dispatch:
 
-
 permissions:
   contents: read
 
@@ -14,7 +13,7 @@ concurrency:
 jobs:
   capture-and-upload:
     name: Capture Steam and upload to Azure
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     env:
@@ -44,6 +43,11 @@ jobs:
       AZURE_PGPASSWORD: ${{ secrets.AZURE_PGPASSWORD }}
 
     steps:
+
+      # ----------------------------------------------------------
+      # PREPARACIÓN
+      # ----------------------------------------------------------
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -58,8 +62,10 @@ jobs:
         run: pip install -r requirements-history.txt
 
       # ----------------------------------------------------------
+      # CAPTURA
       # Azure PostgreSQL permanece APAGADO durante captura + repair.
       # ----------------------------------------------------------
+
       - name: Capture Steam to staged SQLite
         run: python 44_steam_historical_capture_v4_staged.py
 
@@ -67,64 +73,328 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           STAGED_FILE="$(ls -1t captures/*.sqlite | head -n 1)"
+
           test -n "$STAGED_FILE"
+
           echo "STAGED_FILE=$STAGED_FILE" >> "$GITHUB_ENV"
-          echo "Staged capture located."
+
+          echo "Staged capture located:"
+          echo "$STAGED_FILE"
+
+      # ----------------------------------------------------------
+      # REPARACIÓN
+      # ----------------------------------------------------------
 
       - name: Repair missing Store prices
         run: python 47_repair_staged_store_failures.py "$STAGED_FILE"
 
-      # No se enciende Azure si el lote staged sigue incompleto.
-      - name: Verify staged batch is complete
+      # ----------------------------------------------------------
+      # DIAGNÓSTICO
+      # Este paso NO modifica el SQLite.
+      # Sirve para identificar qué fuente está fallando.
+      # ----------------------------------------------------------
+
+      - name: Diagnose staged capture errors
         shell: bash
         run: |
+          set -euo pipefail
+
           python - <<'PY'
           import os
           import sqlite3
 
           path = os.environ["STAGED_FILE"]
+
+          print("=" * 80)
+          print("DIAGNOSTICO DEL STAGED SQLITE")
+          print("=" * 80)
+          print(f"Archivo: {path}")
+          print()
+
           db = sqlite3.connect(path)
+
+          try:
+              tables = [
+                  row[0]
+                  for row in db.execute(
+                      """
+                      SELECT name
+                      FROM sqlite_master
+                      WHERE type = 'table'
+                      ORDER BY name
+                      """
+                  )
+              ]
+
+              print("Tablas encontradas:")
+              for table in tables:
+                  print(f"  - {table}")
+
+              print()
+
+              # --------------------------------------------------
+              # Estado general del lote
+              # --------------------------------------------------
+
+              if "capture_batch" in tables:
+                  row = db.execute(
+                      """
+                      SELECT
+                          expected_games,
+                          captured_games,
+                          error_games,
+                          status
+                      FROM capture_batch
+                      LIMIT 1
+                      """
+                  ).fetchone()
+
+                  print("=" * 80)
+                  print("CAPTURE BATCH")
+                  print("=" * 80)
+
+                  if row:
+                      expected, captured, errors, status = row
+
+                      print(f"expected_games : {expected}")
+                      print(f"captured_games : {captured}")
+                      print(f"error_games    : {errors}")
+                      print(f"status         : {status}")
+                  else:
+                      print("capture_batch no contiene filas.")
+
+                  print()
+
+              # --------------------------------------------------
+              # Buscar columnas *_ok, *_error y status
+              # --------------------------------------------------
+
+              for table in tables:
+
+                  columns = [
+                      row[1]
+                      for row in db.execute(
+                          f'PRAGMA table_info("{table}")'
+                      )
+                  ]
+
+                  interesting = [
+                      column
+                      for column in columns
+                      if column.endswith("_ok")
+                      or column.endswith("_error")
+                      or column == "status"
+                  ]
+
+                  if not interesting:
+                      continue
+
+                  print("=" * 80)
+                  print(f"TABLA: {table}")
+                  print("=" * 80)
+
+                  for column in interesting:
+
+                      # ------------------------------------------
+                      # Columnas booleanas *_ok
+                      # ------------------------------------------
+
+                      if column.endswith("_ok"):
+
+                          ok_count, fail_count, null_count = db.execute(
+                              f'''
+                              SELECT
+                                  SUM(
+                                      CASE
+                                          WHEN "{column}" = 1 THEN 1
+                                          ELSE 0
+                                      END
+                                  ),
+                                  SUM(
+                                      CASE
+                                          WHEN "{column}" = 0 THEN 1
+                                          ELSE 0
+                                      END
+                                  ),
+                                  SUM(
+                                      CASE
+                                          WHEN "{column}" IS NULL THEN 1
+                                          ELSE 0
+                                      END
+                                  )
+                              FROM "{table}"
+                              '''
+                          ).fetchone()
+
+                          print(
+                              f"{column}: "
+                              f"OK={ok_count or 0}, "
+                              f"FAIL={fail_count or 0}, "
+                              f"NULL={null_count or 0}"
+                          )
+
+                      # ------------------------------------------
+                      # Mensajes de error
+                      # ------------------------------------------
+
+                      elif column.endswith("_error"):
+
+                          rows = db.execute(
+                              f'''
+                              SELECT
+                                  "{column}",
+                                  COUNT(*) AS cantidad
+                              FROM "{table}"
+                              WHERE "{column}" IS NOT NULL
+                                AND TRIM(CAST("{column}" AS TEXT)) <> ''
+                              GROUP BY "{column}"
+                              ORDER BY cantidad DESC
+                              LIMIT 10
+                              '''
+                          ).fetchall()
+
+                          if rows:
+                              print()
+                              print(f"{column} - errores principales:")
+
+                              for message, count in rows:
+                                  message = str(message)
+
+                                  if len(message) > 500:
+                                      message = message[:500] + "..."
+
+                                  print(
+                                      f"  {count}x | {message}"
+                                  )
+
+                      # ------------------------------------------
+                      # Distribución de estados
+                      # ------------------------------------------
+
+                      elif column == "status":
+
+                          rows = db.execute(
+                              f'''
+                              SELECT
+                                  status,
+                                  COUNT(*)
+                              FROM "{table}"
+                              GROUP BY status
+                              ORDER BY COUNT(*) DESC
+                              '''
+                          ).fetchall()
+
+                          print()
+                          print("Distribución status:")
+
+                          for status, count in rows:
+                              print(
+                                  f"  {status}: {count}"
+                              )
+
+                  print()
+
+          finally:
+              db.close()
+
+          print("=" * 80)
+          print("FIN DEL DIAGNOSTICO")
+          print("=" * 80)
+          PY
+
+      # ----------------------------------------------------------
+      # VALIDACIÓN DEL LOTE
+      #
+      # Azure NO se enciende si el lote continúa incompleto.
+      # ----------------------------------------------------------
+
+      - name: Verify staged batch is complete
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          path = os.environ["STAGED_FILE"]
+
+          db = sqlite3.connect(path)
+
           try:
               row = db.execute(
                   """
-                  SELECT expected_games, captured_games, error_games, status
+                  SELECT
+                      expected_games,
+                      captured_games,
+                      error_games,
+                      status
                   FROM capture_batch
                   LIMIT 1
                   """
               ).fetchone()
+
           finally:
               db.close()
 
           if row is None:
-              raise SystemExit("capture_batch no existe en el staged SQLite.")
+              raise SystemExit(
+                  "capture_batch no existe en el staged SQLite."
+              )
 
           expected, captured, errors, status = row
+
           print(
-              f"Staged batch: expected={expected}, captured={captured}, "
-              f"errors={errors}, status={status}"
+              f"Staged batch: "
+              f"expected={expected}, "
+              f"captured={captured}, "
+              f"errors={errors}, "
+              f"status={status}"
           )
 
-          if status != "SUCCESS" or int(errors) != 0 or int(captured) != int(expected):
+          if (
+              status != "SUCCESS"
+              or int(errors) != 0
+              or int(captured) != int(expected)
+          ):
               raise SystemExit(
-                  "El lote staged no esta completo. Azure permanecera apagado."
+                  "El lote staged no esta completo. "
+                  "Azure permanecera apagado."
               )
+
+          print("Staged batch completo y valido.")
           PY
 
       # ----------------------------------------------------------
-      # Desde aqui se necesita Azure.
-      # GitHub NO usa OIDC ni Azure CLI: llama al webhook privado
-      # de Azure Automation y le pasa solo la IP de este runner.
+      # DESDE AQUÍ SE NECESITA AZURE
+      #
+      # GitHub no utiliza Azure CLI ni OIDC.
+      # Se llama al webhook privado de Azure Automation.
       # ----------------------------------------------------------
+
       - name: Get GitHub runner public IP
         id: runner_ip
         shell: bash
         run: |
           set -euo pipefail
-          RUNNER_IP="$(curl --fail --silent --show-error https://api.ipify.org)"
+
+          RUNNER_IP="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              https://api.ipify.org
+          )"
+
           test -n "$RUNNER_IP"
+
           echo "runner_ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+
           echo "Runner public IP obtained."
+
+      # ----------------------------------------------------------
 
       - name: Request Azure PostgreSQL START
         shell: bash
@@ -133,12 +403,20 @@ jobs:
           RUNNER_IP: ${{ steps.runner_ip.outputs.runner_ip }}
         run: |
           set -euo pipefail
+
           test -n "$START_WEBHOOK"
           test -n "$RUNNER_IP"
 
-          PAYLOAD="$(printf '{\"runner_ip\":\"%s\"}' "$RUNNER_IP")"
+          PAYLOAD="$(
+            printf \
+              '{\"runner_ip\":\"%s\"}' \
+              "$RUNNER_IP"
+          )"
 
-          curl --fail --silent --show-error \
+          curl \
+            --fail \
+            --silent \
+            --show-error \
             -X POST \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
@@ -147,50 +425,87 @@ jobs:
 
           echo "Azure Automation START webhook accepted."
 
-      # Este script espera la senal REAL: PostgreSQL responde y la
-      # regla temporal de firewall ya permite a este runner conectarse.
+      # ----------------------------------------------------------
+      # Espera la señal REAL:
+      # PostgreSQL está disponible y el firewall acepta al runner.
+      # ----------------------------------------------------------
+
       - name: Wait for Azure PostgreSQL access
         run: python 48_wait_for_azure_postgres.py
 
+      # ----------------------------------------------------------
+      # CARGA A AZURE
+      # ----------------------------------------------------------
+
       - name: Upload staged batch to Azure
-        run: python 45_upload_staged_capture_to_azure.py "$STAGED_FILE"
+        run: |
+          python 45_upload_staged_capture_to_azure.py "$STAGED_FILE"
+
+      # ----------------------------------------------------------
+      # VALIDACIÓN DE LA CARGA
+      # ----------------------------------------------------------
 
       - name: Validate uploaded batch
-        run: python 49_validate_uploaded_batch.py "$STAGED_FILE"
+        run: |
+          python 49_validate_uploaded_batch.py "$STAGED_FILE"
 
-      # Conserva SQLite solo cuando algo falla para poder diagnosticar
-      # o recuperar el lote sin repetir la captura completa.
+      # ----------------------------------------------------------
+      # CONSERVAR SQLITE SOLO SI ALGO FALLA
+      # ----------------------------------------------------------
+
       - name: Preserve staged capture on failure
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: failed-steam-capture-${{ github.run_id }}-${{ github.run_attempt }}
           path: captures/*.sqlite
           if-no-files-found: ignore
           retention-days: 2
 
+
+  # ============================================================
+  # CLEANUP
+  #
+  # Siempre se ejecuta aunque capture-and-upload falle.
+  # ============================================================
+
   cleanup:
     name: Always request Azure shutdown
+
     needs: capture-and-upload
+
     if: always()
-    runs-on: ubuntu-latest
+
+    runs-on: ubuntu-24.04
+
     timeout-minutes: 10
 
     permissions:
       contents: read
 
     steps:
-      # Idempotente: si START nunca ocurrio, el runbook ve Stopped y termina.
-      # Si START ocurrio, elimina gha-runner-temp y solicita STOP.
+
+      # ----------------------------------------------------------
+      # Idempotente:
+      #
+      # - Si START nunca ocurrió, Azure ya está apagado.
+      # - Si START ocurrió, elimina gha-runner-temp y solicita STOP.
+      # ----------------------------------------------------------
+
       - name: Request firewall cleanup and PostgreSQL STOP
         shell: bash
         env:
           STOP_WEBHOOK: ${{ secrets.AZURE_STOP_WEBHOOK_URL }}
+
         run: |
           set -euo pipefail
+
           test -n "$STOP_WEBHOOK"
 
-          curl --fail --silent --show-error \
+          curl \
+            --fail \
+            --silent \
+            --show-error \
             -X POST \
             -H "Content-Type: application/json" \
             -d '{}' \
