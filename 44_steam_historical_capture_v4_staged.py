@@ -23,8 +23,9 @@ load_dotenv()
 # STEAM HISTORICAL CAPTURE v4 STAGED
 #
 # Basada en v3 BALANCED:
-# - mismo rate limiter compartido para appdetails + appreviews
-# - mismo retry diferido por fuente
+# - rate limiters independientes para Store, Reviews WebAPI y Players
+# - retry diferido por fuente
+# - Reviews usa IUserReviewsService/GetAppReviews (endpoint vigente)
 # - NO abre PostgreSQL ni Azure durante las consultas a Steam
 # - guarda la captura en un SQLite local temporal
 #
@@ -41,6 +42,12 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 STORE_DOMAIN_INTERVAL = float(
     os.getenv("STORE_DOMAIN_INTERVAL_SECONDS", "0.35")
 )
+# IUserReviewsService tiene un rate limit anónimo compartido más bajo.
+# 1.70 s ≈ 35 requests/minuto, suficientemente conservador para 1000 juegos
+# dentro del timeout del workflow.
+REVIEWS_INTERVAL = float(
+    os.getenv("REVIEWS_INTERVAL_SECONDS", "1.70")
+)
 PLAYERS_INTERVAL = float(
     os.getenv("PLAYERS_INTERVAL_SECONDS", "0.05")
 )
@@ -50,6 +57,9 @@ DEFERRED_RETRY_WAIT = float(
 )
 DEFERRED_STORE_DOMAIN_INTERVAL = float(
     os.getenv("DEFERRED_STORE_DOMAIN_INTERVAL_SECONDS", "0.85")
+)
+DEFERRED_REVIEWS_INTERVAL = float(
+    os.getenv("DEFERRED_REVIEWS_INTERVAL_SECONDS", "2.50")
 )
 DEFERRED_PLAYERS_INTERVAL = float(
     os.getenv("DEFERRED_PLAYERS_INTERVAL_SECONDS", "0.20")
@@ -66,7 +76,10 @@ OUTPUT_DIR = Path(
 )
 
 STORE_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
-REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
+REVIEWS_URL = (
+    "https://api.steampowered.com/"
+    "IUserReviewsService/GetAppReviews/v1/"
+)
 PLAYERS_URL = (
     "https://api.steampowered.com/"
     "ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
@@ -91,8 +104,11 @@ class RateGate:
 
 
 store_domain_gate = RateGate(STORE_DOMAIN_INTERVAL)
+reviews_gate = RateGate(REVIEWS_INTERVAL)
 players_gate = RateGate(PLAYERS_INTERVAL)
+
 deferred_store_domain_gate = RateGate(DEFERRED_STORE_DOMAIN_INTERVAL)
+deferred_reviews_gate = RateGate(DEFERRED_REVIEWS_INTERVAL)
 deferred_players_gate = RateGate(DEFERRED_PLAYERS_INTERVAL)
 
 
@@ -213,39 +229,141 @@ def fetch_reviews(
     *,
     deferred: bool = False,
 ) -> dict[str, Any]:
-    gate = deferred_store_domain_gate if deferred else store_domain_gate
-    gate.wait()
-    payload = get_json(
-        s,
-        REVIEWS_URL.format(appid=appid),
-        {
-            "json": 1,
-            "filter": "all",
-            "language": "all",
-            "review_type": "all",
-            "purchase_type": "all",
-            "num_per_page": 1,
-        },
-    )
-    if payload.get("success") != 1:
-        raise RuntimeError("reviews success != 1")
+    """
+    Obtiene el resumen de reviews usando el endpoint vigente:
+    IUserReviewsService/GetAppReviews.
 
-    q = payload.get("query_summary") or {}
-    positive = q.get("total_positive")
-    negative = q.get("total_negative")
-    total = q.get("total_reviews")
+    Desde octubre de 2026 el antiguo
+    store.steampowered.com/appreviews/<appid>?json=1
+    fue deshabilitado por Valve.
 
-    ratio = None
-    if isinstance(positive, int) and isinstance(total, int) and total > 0:
-        ratio = round(positive * 100.0 / total, 4)
+    Este Service Interface recibe los argumentos mediante input_json.
+    No se requiere API key para consultas públicas, aunque las llamadas
+    anónimas tienen un rate limit compartido más bajo.
+    """
+    gate = deferred_reviews_gate if deferred else reviews_gate
 
-    return {
-        "review_score": q.get("review_score"),
-        "total_positive_reviews": positive,
-        "total_negative_reviews": negative,
-        "total_reviews": total,
-        "positive_review_ratio_pct": ratio,
+    input_payload = {
+        "appid": appid,
+
+        # Helpful. Como day_range=0, no limitamos el histórico.
+        "filter": 0,
+        "day_range": 0,
+
+        # "all" ahora es una lista.
+        "languages": ["all"],
+
+        # Todos los tipos de review.
+        "review_type": 0,
+
+        # Steam + compras externas.
+        "purchase_type": 1,
+
+        # Solo necesitamos query_summary.
+        "num_per_page": 1,
     }
+
+    # Un intento inmediato y, si Steam devuelve 429, dos esperas
+    # conservadoras antes de dejar que el retry diferido se encargue.
+    last_error: Exception | None = None
+
+    for attempt in range(1, 4):
+        gate.wait()
+
+        try:
+            response = s.get(
+                REVIEWS_URL,
+                params={
+                    "input_json": json.dumps(
+                        input_payload,
+                        separators=(",", ":"),
+                    )
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 429:
+                retry_after_raw = response.headers.get("Retry-After")
+                try:
+                    retry_after = float(retry_after_raw)
+                except (TypeError, ValueError):
+                    retry_after = 8.0 * attempt
+
+                last_error = RuntimeError("HTTP 429")
+
+                if attempt < 3:
+                    # No dormimos dentro del RateGate; el gate seguirá
+                    # garantizando separación global entre requests.
+                    time.sleep(max(2.0, retry_after))
+                    continue
+
+                raise last_error
+
+            if response.status_code == 403:
+                raise RuntimeError("HTTP 403")
+
+            response.raise_for_status()
+
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                body = response.text[:300].replace("\n", " ")
+                raise RuntimeError(
+                    "reviews non-json "
+                    f"HTTP {response.status_code}: {body!r}"
+                ) from exc
+
+            # Los Service Interfaces normalmente envuelven la respuesta
+            # en {"response": {...}}. Mantenemos fallback por robustez.
+            data = payload.get("response")
+            if not isinstance(data, dict):
+                data = payload
+
+            q = data.get("query_summary")
+            if not isinstance(q, dict):
+                raise RuntimeError("reviews query_summary ausente")
+
+            positive = q.get("total_positive")
+            negative = q.get("total_negative")
+            total = q.get("total_reviews")
+
+            # Para títulos sin reviews, Steam puede devolver 0.
+            # Si los campos no existen, preferimos fallar y reintentar
+            # antes que convertir una respuesta incompleta en dato válido.
+            if not all(
+                isinstance(value, int)
+                for value in (positive, negative, total)
+            ):
+                raise RuntimeError(
+                    "reviews summary incompleto: "
+                    f"positive={positive!r}, "
+                    f"negative={negative!r}, "
+                    f"total={total!r}"
+                )
+
+            ratio = None
+            if total > 0:
+                ratio = round(positive * 100.0 / total, 4)
+
+            return {
+                "review_score": q.get("review_score"),
+                "total_positive_reviews": positive,
+                "total_negative_reviews": negative,
+                "total_reviews": total,
+                "positive_review_ratio_pct": ratio,
+            }
+
+        except Exception as exc:
+            last_error = exc
+
+            # 403 no se arregla con espera local.
+            if "HTTP 403" in str(exc):
+                break
+
+            if attempt < 3:
+                time.sleep(min(10.0, 2.0 * attempt))
+
+    raise last_error or RuntimeError("Reviews API fallo sin detalle")
 
 
 def fetch_players(
@@ -314,6 +432,10 @@ def is_retryable(message: str | None) -> bool:
         for token in (
             "http 429",
             "http 403",
+            "non-json",
+            "jsondecode",
+            "query_summary ausente",
+            "summary incompleto",
             "timeout",
             "timed out",
             "connection",
@@ -661,9 +783,11 @@ def main() -> None:
         print(f"archivo:                       {out_path}")
         print(f"juegos:                        {len(games):,}")
         print(f"workers:                       {HIST_WORKERS}")
-        print(f"store-domain shared interval:  {STORE_DOMAIN_INTERVAL:.2f}s")
+        print(f"store interval:                {STORE_DOMAIN_INTERVAL:.2f}s")
+        print(f"reviews interval:              {REVIEWS_INTERVAL:.2f}s")
         print(f"players interval:              {PLAYERS_INTERVAL:.2f}s")
-        print(f"deferred store-domain:         {DEFERRED_STORE_DOMAIN_INTERVAL:.2f}s")
+        print(f"deferred store interval:       {DEFERRED_STORE_DOMAIN_INTERVAL:.2f}s")
+        print(f"deferred reviews interval:     {DEFERRED_REVIEWS_INTERVAL:.2f}s")
         print("=" * 96)
         print()
 
